@@ -21,6 +21,22 @@ services:
         sync: false
       - key: INSTAGRAM_TOKEN_ENCRYPTED
         sync: false
+      - key: FACEBOOK_APP_ID
+        sync: false
+      - key: FACEBOOK_APP_SECRET
+        sync: false
+      - key: FACEBOOK_REDIRECT_URI
+        sync: false
+      - key: FACEBOOK_TOKEN_ENCRYPTED
+        sync: false
+      - key: THREADS_APP_ID
+        sync: false
+      - key: THREADS_APP_SECRET
+        sync: false
+      - key: THREADS_REDIRECT_URI
+        sync: false
+      - key: THREADS_TOKEN_ENCRYPTED
+        sync: false
       - key: SESSION_SECRET
         sync: false
       - key: TOKEN_ENCRYPTION_KEY

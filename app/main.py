@@ -1,19 +1,20 @@
-"""OAuth callback service for the Telegram-to-social-posting automation.
+"""Telegram-to-Social-Media posting automation backend.
 
-This is intentionally a small first slice: it lets the owner connect an
-Instagram Professional account with OAuth. It does not publish posts yet.
+Supports Instagram, Facebook Page, and Threads publishing with an approval-first
+workflow via Telegram, Gemini caption generation, and Render Free deployment support.
 """
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import hashlib
 import json
 import logging
 import os
 import secrets
 import sqlite3
-import base64
-import asyncio
+import time
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -60,10 +61,12 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 AUTHORIZED_TELEGRAM_USER_ID = os.environ.get("AUTHORIZED_TELEGRAM_USER_ID", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 
-SCOPES = "instagram_business_basic,instagram_business_content_publish"
+INSTAGRAM_SCOPES = "instagram_business_basic,instagram_business_content_publish"
+FACEBOOK_SCOPES = "pages_show_list,pages_read_engagement,pages_manage_posts"
+THREADS_SCOPES = "threads_basic,threads_content_publish"
 
 app = FastAPI(title="Photo Automation")
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET or "not-configured")
@@ -85,30 +88,61 @@ def database() -> sqlite3.Connection:
             status TEXT NOT NULL,
             awaiting_edit INTEGER NOT NULL DEFAULT 0,
             instagram_media_id TEXT,
+            facebook_post_id TEXT,
+            threads_media_id TEXT,
+            published_summary TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
+    for col_name, col_type in [
+        ("facebook_post_id", "TEXT"),
+        ("threads_media_id", "TEXT"),
+        ("published_summary", "TEXT"),
+    ]:
+        try:
+            connection.execute(f"ALTER TABLE posts ADD COLUMN {col_name} {col_type}")
+        except sqlite3.OperationalError:
+            pass
     return connection
+
+
+def cleanup_stale_media(max_age_hours: int = 24) -> None:
+    if not MEDIA_DIR.exists():
+        return
+    cutoff = time.time() - (max_age_hours * 3600)
+    for file in MEDIA_DIR.glob("*"):
+        if file.is_file():
+            try:
+                if file.stat().st_mtime < cutoff:
+                    file.unlink(missing_ok=True)
+                    logger.info("Cleaned up stale media file %s", file.name)
+            except Exception:
+                pass
+
+
+async def delayed_cleanup_media(media_name: str, delay_seconds: int = 30) -> None:
+    """Clean up uploaded media file after a delay to ensure platform CDNs completed fetching."""
+    try:
+        await asyncio.sleep(delay_seconds)
+        media_path = MEDIA_DIR / media_name
+        if media_path.exists():
+            media_path.unlink(missing_ok=True)
+            logger.info("Cleaned up media file %s", media_name)
+    except Exception:
+        logger.warning("Failed to clean up media file %s", media_name)
 
 
 @app.on_event("startup")
 async def initialise_database() -> None:
     connection = database()
     connection.close()
+    cleanup_stale_media()
 
 
 def configured() -> bool:
-    return all(
-        [
-            INSTAGRAM_APP_ID,
-            INSTAGRAM_APP_SECRET,
-            INSTAGRAM_REDIRECT_URI,
-            SESSION_SECRET,
-            TOKEN_ENCRYPTION_KEY,
-        ]
-    )
+    return all([INSTAGRAM_APP_ID, INSTAGRAM_APP_SECRET, INSTAGRAM_REDIRECT_URI, SESSION_SECRET, TOKEN_ENCRYPTION_KEY])
 
 
 def facebook_configured() -> bool:
@@ -139,33 +173,76 @@ def load_encrypted(path: Path) -> dict[str, Any]:
         encrypted = os.environ.get("INSTAGRAM_TOKEN_ENCRYPTED", "")
         if encrypted:
             return json.loads(fernet().decrypt(encrypted.encode()).decode())
+    elif path == FACEBOOK_TOKEN_FILE and not path.exists():
+        encrypted = os.environ.get("FACEBOOK_TOKEN_ENCRYPTED", "")
+        if encrypted:
+            return json.loads(fernet().decrypt(encrypted.encode()).decode())
+    elif path == THREADS_TOKEN_FILE and not path.exists():
+        encrypted = os.environ.get("THREADS_TOKEN_ENCRYPTED", "")
+        if encrypted:
+            return json.loads(fernet().decrypt(encrypted.encode()).decode())
     return json.loads(fernet().decrypt(path.read_bytes()).decode())
+
+
+def is_instagram_connected() -> bool:
+    if TOKEN_FILE.exists():
+        return True
+    return bool(os.environ.get("INSTAGRAM_TOKEN_ENCRYPTED"))
+
+
+def is_facebook_connected() -> bool:
+    if FACEBOOK_TOKEN_FILE.exists():
+        return True
+    return bool(os.environ.get("FACEBOOK_TOKEN_ENCRYPTED"))
+
+
+def is_threads_connected() -> bool:
+    if THREADS_TOKEN_FILE.exists():
+        return True
+    return bool(os.environ.get("THREADS_TOKEN_ENCRYPTED"))
 
 
 @app.get("/", response_class=HTMLResponse)
 async def home() -> str:
-    instagram_status = "credentials saved" if TOKEN_FILE.exists() or os.environ.get("INSTAGRAM_TOKEN_ENCRYPTED") else "not connected"
-    facebook_status = "connected" if FACEBOOK_TOKEN_FILE.exists() else "not connected"
-    threads_status = "connected" if THREADS_TOKEN_FILE.exists() else "not connected"
+    instagram_status = "connected" if is_instagram_connected() else "not connected"
+    facebook_status = "connected" if is_facebook_connected() else "not connected"
+    threads_status = "connected" if is_threads_connected() else "not connected"
     return f"""
-    <h1>Photo Automation</h1>
-    <p>Instagram: <strong>{instagram_status}</strong></p>
-    <p>Facebook Page: <strong>{facebook_status}</strong></p>
-    <p>Threads: <strong>{threads_status}</strong></p>
-    <p><a href='/auth/instagram/connect'>Connect Instagram</a></p>
-    <p><a href='/auth/facebook/connect'>Connect Facebook Page</a></p>
-    <p><a href='/auth/threads/connect'>Connect Threads</a></p>
+    <!DOCTYPE html>
+    <html>
+    <head><title>Photo Automation</title></head>
+    <body style="font-family: sans-serif; max-width: 600px; margin: 40px auto; line-height: 1.6;">
+        <h1>Photo Automation</h1>
+        <p>Instagram: <strong>{instagram_status}</strong></p>
+        <p>Facebook Page: <strong>{facebook_status}</strong></p>
+        <p>Threads: <strong>{threads_status}</strong></p>
+        <hr>
+        <p><a href='/auth/instagram/connect'>Connect Instagram</a></p>
+        <p><a href='/auth/facebook/connect'>Connect Facebook Page</a></p>
+        <p><a href='/auth/threads/connect'>Connect Threads</a></p>
+        <hr>
+        <p><a href='/auth/refresh'>Refresh Tokens</a> | <a href='/health'>Health Check</a></p>
+    </body>
+    </html>
     """
 
 
+@app.get("/ping")
+async def ping() -> dict[str, Any]:
+    return {"ok": True, "service": "photo-automation", "timestamp": time.time()}
+
+
 @app.get("/health")
-async def health() -> dict[str, bool]:
+async def health() -> dict[str, Any]:
     return {
         "ok": True,
         "instagram_oauth_configured": configured(),
         "facebook_oauth_configured": facebook_configured(),
         "threads_oauth_configured": threads_configured(),
-        "telegram_instagram_workflow_configured": telegram_configured(),
+        "telegram_workflow_configured": telegram_configured(),
+        "instagram_connected": is_instagram_connected(),
+        "facebook_connected": is_facebook_connected(),
+        "threads_connected": is_threads_connected(),
     }
 
 
@@ -232,6 +309,15 @@ async def telegram_api(method: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 async def telegram_send_preview(post: sqlite3.Row | dict[str, Any]) -> None:
+    connected = []
+    if is_instagram_connected():
+        connected.append("Instagram")
+    if is_facebook_connected():
+        connected.append("Facebook Page")
+    if is_threads_connected():
+        connected.append("Threads")
+    destinations = ", ".join(connected) if connected else "None (connect accounts first)"
+
     keyboard = {
         "inline_keyboard": [
             [{"text": "Approve & publish", "callback_data": f"approve:{post['id']}"}],
@@ -244,7 +330,7 @@ async def telegram_send_preview(post: sqlite3.Row | dict[str, Any]) -> None:
         {
             "chat_id": post["telegram_chat_id"],
             "photo": f"{PUBLIC_BASE_URL}/media/{post['media_name']}",
-            "caption": f"Instagram draft:\n\n{post['caption']}\n\nNothing will be published until you approve.",
+            "caption": f"📝 Social Draft (Publish to: {destinations}):\n\n{post['caption']}\n\nNothing will be published until you approve.",
             "reply_markup": keyboard,
         },
     )
@@ -270,8 +356,6 @@ Return only the final caption, with no title or analysis."""
         "generationConfig": {
             "temperature": 0.65,
             "maxOutputTokens": 500,
-            # Gemini 3 uses part of the output budget for reasoning by default.
-            # Minimal thinking leaves enough room for a complete social caption.
             "thinkingConfig": {"thinkingLevel": "MINIMAL"},
         },
     }
@@ -298,7 +382,7 @@ Return only the final caption, with no title or analysis."""
     return caption[:2200]
 
 
-async def publish_to_instagram(post: sqlite3.Row) -> str:
+async def publish_to_instagram(post: sqlite3.Row | dict[str, Any]) -> str:
     instagram = load_encrypted(TOKEN_FILE)
     access_token = instagram["access_token"]
     instagram_user_id = instagram.get("profile", {}).get("user_id") or instagram.get("user_id")
@@ -315,13 +399,18 @@ async def publish_to_instagram(post: sqlite3.Row) -> str:
         )
         if container_response.is_error:
             logger.warning("Instagram container creation returned HTTP %s: %s", container_response.status_code, container_response.text[:1000])
-            raise RuntimeError("Instagram rejected the image or caption")
+            err_msg = "Instagram rejected the image or caption"
+            try:
+                err_data = container_response.json().get("error", {})
+                if "message" in err_data:
+                    err_msg = f"Instagram: {err_data['message']}"
+            except Exception:
+                pass
+            raise RuntimeError(err_msg)
         creation_id = container_response.json().get("id")
         if not creation_id:
             raise RuntimeError("Instagram did not return a media container")
 
-        # Instagram processes the container asynchronously. Publishing before
-        # it reaches FINISHED returns error 9007 ("Media ID is not available").
         ready = False
         for _ in range(30):
             status_response = await client.get(
@@ -335,7 +424,7 @@ async def publish_to_instagram(post: sqlite3.Row) -> str:
                 break
             if status_code in {"ERROR", "EXPIRED"}:
                 logger.warning("Instagram media container status is %s", status_code)
-                raise RuntimeError("Instagram could not process the image")
+                raise RuntimeError(f"Instagram could not process the image (status: {status_code})")
             await asyncio.sleep(2)
         if not ready:
             raise RuntimeError("Instagram media processing timed out")
@@ -350,7 +439,208 @@ async def publish_to_instagram(post: sqlite3.Row) -> str:
     media_id = publish_response.json().get("id")
     if not media_id:
         raise RuntimeError("Instagram did not return a published media ID")
-    return media_id
+    return str(media_id)
+
+
+async def publish_to_facebook_page(post: sqlite3.Row | dict[str, Any]) -> str:
+    facebook = load_encrypted(FACEBOOK_TOKEN_FILE)
+    access_token = facebook.get("access_token")
+    page_id = facebook.get("id")
+    if not access_token or not page_id:
+        raise RuntimeError("Connected Facebook Page information is missing. Reconnect Facebook Page.")
+    async with httpx.AsyncClient(timeout=90) as client:
+        response = await client.post(
+            f"https://graph.facebook.com/v23.0/{page_id}/photos",
+            data={
+                "url": f"{PUBLIC_BASE_URL}/media/{post['media_name']}",
+                "caption": post["caption"],
+                "access_token": access_token,
+            },
+        )
+    if response.is_error:
+        logger.warning("Facebook photo publish returned HTTP %s: %s", response.status_code, response.text[:1000])
+        err_msg = "Facebook rejected the post"
+        try:
+            err_json = response.json()
+            if "error" in err_json and "message" in err_json["error"]:
+                err_msg = f"Facebook: {err_json['error']['message']}"
+        except Exception:
+            pass
+        raise RuntimeError(err_msg)
+    body = response.json()
+    post_id = body.get("post_id") or body.get("id")
+    if not post_id:
+        raise RuntimeError("Facebook did not return a published post ID")
+    return str(post_id)
+
+
+async def publish_to_threads(post: sqlite3.Row | dict[str, Any]) -> str:
+    threads = load_encrypted(THREADS_TOKEN_FILE)
+    access_token = threads.get("access_token")
+    threads_user_id = threads.get("profile", {}).get("id") or threads.get("user_id") or threads.get("id")
+    if not access_token or not threads_user_id:
+        raise RuntimeError("Connected Threads account ID is missing. Reconnect Threads.")
+    async with httpx.AsyncClient(timeout=90) as client:
+        container_response = await client.post(
+            f"https://graph.threads.net/v1.0/{threads_user_id}/threads",
+            data={
+                "media_type": "IMAGE",
+                "image_url": f"{PUBLIC_BASE_URL}/media/{post['media_name']}",
+                "text": post["caption"],
+                "access_token": access_token,
+            },
+        )
+        if container_response.is_error:
+            logger.warning("Threads container creation returned HTTP %s: %s", container_response.status_code, container_response.text[:1000])
+            err_msg = "Threads rejected the image or caption"
+            try:
+                err_json = container_response.json()
+                if "error" in err_json and "message" in err_json["error"]:
+                    err_msg = f"Threads: {err_json['error']['message']}"
+            except Exception:
+                pass
+            raise RuntimeError(err_msg)
+        creation_id = container_response.json().get("id")
+        if not creation_id:
+            raise RuntimeError("Threads did not return a media container")
+
+        ready = False
+        for _ in range(30):
+            status_response = await client.get(
+                f"https://graph.threads.net/v1.0/{creation_id}",
+                params={"fields": "status,error_message", "access_token": access_token},
+            )
+            status_data = status_response.json() if status_response.is_success else {}
+            status_code = status_data.get("status")
+            if status_code in {"FINISHED", "PUBLISHED"}:
+                ready = True
+                break
+            if status_code in {"ERROR", "EXPIRED"}:
+                error_msg = status_data.get("error_message", status_code)
+                logger.warning("Threads container status is %s: %s", status_code, error_msg)
+                raise RuntimeError(f"Threads could not process the image: {error_msg}")
+            await asyncio.sleep(2)
+        if not ready:
+            raise RuntimeError("Threads media processing timed out")
+
+        publish_response = await client.post(
+            f"https://graph.threads.net/v1.0/{threads_user_id}/threads_publish",
+            data={"creation_id": creation_id, "access_token": access_token},
+        )
+    if publish_response.is_error:
+        logger.warning("Threads publish returned HTTP %s: %s", publish_response.status_code, publish_response.text[:1000])
+        raise RuntimeError("Threads did not publish the post")
+    media_id = publish_response.json().get("id")
+    if not media_id:
+        raise RuntimeError("Threads did not return a published media ID")
+    return str(media_id)
+
+
+async def publish_all_connected(post: sqlite3.Row | dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Publish the approved post to all connected social media platforms."""
+    connected_platforms = []
+    if is_instagram_connected():
+        connected_platforms.append("instagram")
+    if is_facebook_connected():
+        connected_platforms.append("facebook")
+    if is_threads_connected():
+        connected_platforms.append("threads")
+
+    if not connected_platforms:
+        raise RuntimeError("No social accounts are connected. Connect Instagram, Facebook, or Threads first.")
+
+    results: dict[str, dict[str, Any]] = {}
+
+    if "instagram" in connected_platforms:
+        try:
+            ig_id = await publish_to_instagram(post)
+            results["instagram"] = {"success": True, "id": ig_id}
+        except Exception as e:
+            logger.exception("Instagram publishing failed")
+            results["instagram"] = {"success": False, "error": str(e)}
+
+    if "facebook" in connected_platforms:
+        try:
+            fb_id = await publish_to_facebook_page(post)
+            results["facebook"] = {"success": True, "id": fb_id}
+        except Exception as e:
+            logger.exception("Facebook publishing failed")
+            results["facebook"] = {"success": False, "error": str(e)}
+
+    if "threads" in connected_platforms:
+        try:
+            th_id = await publish_to_threads(post)
+            results["threads"] = {"success": True, "id": th_id}
+        except Exception as e:
+            logger.exception("Threads publishing failed")
+            results["threads"] = {"success": False, "error": str(e)}
+
+    return results
+
+
+async def refresh_instagram_token() -> dict[str, Any]:
+    if not is_instagram_connected():
+        return {"ok": False, "error": "Instagram not connected"}
+    data = load_encrypted(TOKEN_FILE)
+    access_token = data.get("access_token")
+    if not access_token:
+        return {"ok": False, "error": "No Instagram access token found"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(
+            "https://graph.instagram.com/refresh_access_token",
+            params={"grant_type": "ig_refresh_token", "access_token": access_token},
+        )
+    if response.is_error:
+        logger.warning("Instagram token refresh failed: HTTP %s: %s", response.status_code, response.text[:500])
+        return {"ok": False, "error": f"Instagram refresh failed: HTTP {response.status_code}"}
+    refreshed = response.json()
+    new_token = refreshed.get("access_token")
+    if not new_token:
+        return {"ok": False, "error": "No token returned from Instagram refresh"}
+    data["access_token"] = new_token
+    if "expires_in" in refreshed:
+        data["expires_in"] = refreshed["expires_in"]
+    data["token_fingerprint"] = hashlib.sha256(new_token.encode()).hexdigest()[:12]
+    save_encrypted(TOKEN_FILE, data)
+    return {"ok": True, "account": "instagram", "expires_in": refreshed.get("expires_in")}
+
+
+async def refresh_threads_token() -> dict[str, Any]:
+    if not is_threads_connected():
+        return {"ok": False, "error": "Threads not connected"}
+    data = load_encrypted(THREADS_TOKEN_FILE)
+    access_token = data.get("access_token")
+    if not access_token:
+        return {"ok": False, "error": "No Threads access token found"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(
+            "https://graph.threads.net/refresh_access_token",
+            params={"grant_type": "th_refresh_token", "access_token": access_token},
+        )
+    if response.is_error:
+        logger.warning("Threads token refresh failed: HTTP %s: %s", response.status_code, response.text[:500])
+        return {"ok": False, "error": f"Threads refresh failed: HTTP {response.status_code}"}
+    refreshed = response.json()
+    new_token = refreshed.get("access_token")
+    if not new_token:
+        return {"ok": False, "error": "No token returned from Threads refresh"}
+    data["access_token"] = new_token
+    if "expires_in" in refreshed:
+        data["expires_in"] = refreshed["expires_in"]
+    data["token_fingerprint"] = hashlib.sha256(new_token.encode()).hexdigest()[:12]
+    save_encrypted(THREADS_TOKEN_FILE, data)
+    return {"ok": True, "account": "threads", "expires_in": refreshed.get("expires_in")}
+
+
+@app.api_route("/auth/refresh", methods=["GET", "POST"])
+async def refresh_tokens_endpoint() -> dict[str, Any]:
+    ig_result = await refresh_instagram_token() if is_instagram_connected() else {"ok": None, "account": "instagram", "status": "not connected"}
+    th_result = await refresh_threads_token() if is_threads_connected() else {"ok": None, "account": "threads", "status": "not connected"}
+    return {
+        "ok": True,
+        "instagram": ig_result,
+        "threads": th_result,
+    }
 
 
 @app.get("/media/{media_name}")
@@ -407,9 +697,9 @@ async def handle_telegram_message(message: dict[str, Any]) -> None:
     connection.close()
     photos = message.get("photo", [])
     if not photos:
-        await telegram_api("sendMessage", {"chat_id": chat_id, "text": "Send one photo to create an Instagram draft."})
+        await telegram_api("sendMessage", {"chat_id": chat_id, "text": "Send one photo to create a social media draft."})
         return
-    await telegram_api("sendMessage", {"chat_id": chat_id, "text": "Creating an Instagram caption draft…"})
+    await telegram_api("sendMessage", {"chat_id": chat_id, "text": "Creating caption draft with Gemini…"})
     photo = photos[-1]
     file_info = await telegram_api("getFile", {"file_id": photo["file_id"]})
     file_path = file_info["file_path"]
@@ -452,12 +742,13 @@ async def handle_telegram_callback(callback: dict[str, Any]) -> None:
         connection.commit()
         connection.close()
         await telegram_api("sendMessage", {"chat_id": message["chat"]["id"], "text": "Draft cancelled."})
+        asyncio.create_task(delayed_cleanup_media(post["media_name"], delay_seconds=5))
         return
     if action == "edit":
         connection.execute("UPDATE posts SET awaiting_edit = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (post_id,))
         connection.commit()
         connection.close()
-        await telegram_api("sendMessage", {"chat_id": message["chat"]["id"], "text": "Send the replacement Instagram caption as your next message."})
+        await telegram_api("sendMessage", {"chat_id": message["chat"]["id"], "text": "Send the replacement caption as your next message."})
         return
     if action == "regenerate":
         caption = await generate_caption(MEDIA_DIR / post["media_name"], post["mime_type"])
@@ -475,20 +766,56 @@ async def handle_telegram_callback(callback: dict[str, Any]) -> None:
         connection.commit()
         publishing_post = connection.execute("SELECT * FROM posts WHERE id = ?", (post_id,)).fetchone()
         connection.close()
-        try:
-            media_id = await publish_to_instagram(publishing_post)
-            connection = database()
-            connection.execute("UPDATE posts SET status = 'PUBLISHED', instagram_media_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (media_id, post_id))
-            connection.commit()
-            connection.close()
-            await telegram_api("sendMessage", {"chat_id": message["chat"]["id"], "text": f"Published to Instagram successfully. Media ID: {media_id}"})
-        except Exception:
-            logger.exception("Instagram publishing failed")
-            connection = database()
-            connection.execute("UPDATE posts SET status = 'FAILED', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (post_id,))
-            connection.commit()
-            connection.close()
-            await telegram_api("sendMessage", {"chat_id": message["chat"]["id"], "text": "Instagram publishing failed. No automatic retry was sent; your draft is retained for review."})
+
+        results = await publish_all_connected(publishing_post)
+
+        all_success = all(r.get("success") for r in results.values())
+        any_success = any(r.get("success") for r in results.values())
+
+        if all_success:
+            overall_status = "PUBLISHED"
+        elif any_success:
+            overall_status = "PARTIAL_SUCCESS"
+        else:
+            overall_status = "FAILED"
+
+        ig_id = results.get("instagram", {}).get("id") if results.get("instagram", {}).get("success") else None
+        fb_id = results.get("facebook", {}).get("id") if results.get("facebook", {}).get("success") else None
+        th_id = results.get("threads", {}).get("id") if results.get("threads", {}).get("success") else None
+        summary_json = json.dumps(results)
+
+        connection = database()
+        connection.execute(
+            """
+            UPDATE posts 
+            SET status = ?, 
+                instagram_media_id = COALESCE(?, instagram_media_id),
+                facebook_post_id = ?,
+                threads_media_id = ?,
+                published_summary = ?,
+                updated_at = CURRENT_TIMESTAMP 
+            WHERE id = ?
+            """,
+            (overall_status, ig_id, fb_id, th_id, summary_json, post_id),
+        )
+        connection.commit()
+        connection.close()
+
+        lines = ["📢 Publication Summary:"]
+        for platform, res in results.items():
+            name = {"instagram": "Instagram", "facebook": "Facebook Page", "threads": "Threads"}.get(platform, platform)
+            if res.get("success"):
+                lines.append(f"✅ {name}: Published (ID: {res['id']})")
+            else:
+                lines.append(f"❌ {name}: Failed ({res.get('error', 'unknown error')})")
+
+        if overall_status == "FAILED":
+            lines.append("\nNo automatic retry was sent; your draft is retained for review.")
+
+        await telegram_api("sendMessage", {"chat_id": message["chat"]["id"], "text": "\n".join(lines)})
+
+        # Delayed media cleanup after publish completes
+        asyncio.create_task(delayed_cleanup_media(publishing_post["media_name"], delay_seconds=30))
 
 
 @app.get("/auth/instagram/connect")
@@ -504,7 +831,7 @@ async def connect_instagram(request: Request) -> RedirectResponse:
             "client_id": INSTAGRAM_APP_ID,
             "redirect_uri": INSTAGRAM_REDIRECT_URI,
             "response_type": "code",
-            "scope": SCOPES,
+            "scope": INSTAGRAM_SCOPES,
             "state": state,
         }
     )
@@ -541,8 +868,6 @@ async def instagram_callback(request: Request, code: str | None = None, state: s
                 logger.warning("Instagram token exchange returned no access token")
                 raise HTTPException(status_code=502, detail="Instagram did not return an access token.")
 
-            # The authorization-code exchange returns a short-lived token.
-            # Exchange it immediately for the long-lived token used by the worker.
             long_lived_response = await client.get(
                 "https://graph.instagram.com/access_token",
                 params={
@@ -564,7 +889,6 @@ async def instagram_callback(request: Request, code: str | None = None, state: s
             )
             profile = profile_response.json() if profile_response.is_success else {}
 
-        # Store only encrypted credentials. Do not display the token in the browser or logs.
         token_data["profile"] = profile
         token_data["token_fingerprint"] = hashlib.sha256(access_token.encode()).hexdigest()[:12]
         save_encrypted(TOKEN_FILE, token_data)
@@ -588,7 +912,7 @@ async def connect_facebook(request: Request) -> RedirectResponse:
             "client_id": FACEBOOK_APP_ID,
             "redirect_uri": FACEBOOK_REDIRECT_URI,
             "response_type": "code",
-            "scope": "pages_show_list,pages_read_engagement,pages_manage_posts",
+            "scope": FACEBOOK_SCOPES,
             "state": state,
         }
     )
@@ -619,6 +943,19 @@ async def facebook_callback(request: Request, code: str | None = None, state: st
             user_token = token_response.json().get("access_token")
             if not user_token:
                 raise HTTPException(status_code=502, detail="Facebook did not return an access token.")
+
+            long_lived_response = await client.get(
+                "https://graph.facebook.com/v23.0/oauth/access_token",
+                params={
+                    "grant_type": "fb_exchange_token",
+                    "client_id": FACEBOOK_APP_ID,
+                    "client_secret": FACEBOOK_APP_SECRET,
+                    "fb_exchange_token": user_token,
+                },
+            )
+            if long_lived_response.is_success and long_lived_response.json().get("access_token"):
+                user_token = long_lived_response.json()["access_token"]
+
             pages_response = await client.get(
                 "https://graph.facebook.com/v23.0/me/accounts",
                 params={"fields": "id,name,access_token", "access_token": user_token},
@@ -671,7 +1008,7 @@ async def connect_threads(request: Request) -> RedirectResponse:
             "client_id": THREADS_APP_ID,
             "redirect_uri": THREADS_REDIRECT_URI,
             "response_type": "code",
-            "scope": "threads_basic,threads_content_publish",
+            "scope": THREADS_SCOPES,
             "state": state,
         }
     )
@@ -704,6 +1041,19 @@ async def threads_callback(request: Request, code: str | None = None, state: str
             access_token = token_data.get("access_token")
             if not access_token:
                 raise HTTPException(status_code=502, detail="Threads did not return an access token.")
+
+            long_lived_response = await client.get(
+                "https://graph.threads.net/access_token",
+                params={
+                    "grant_type": "th_exchange_token",
+                    "client_secret": THREADS_APP_SECRET,
+                    "access_token": access_token,
+                },
+            )
+            if long_lived_response.is_success and long_lived_response.json().get("access_token"):
+                token_data.update(long_lived_response.json())
+                access_token = token_data["access_token"]
+
             profile_response = await client.get(
                 "https://graph.threads.net/me",
                 params={"fields": "id,username", "access_token": access_token},

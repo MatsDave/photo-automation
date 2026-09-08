@@ -60,9 +60,9 @@ TOKEN_ENCRYPTION_KEY = os.environ.get("TOKEN_ENCRYPTION_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 AUTHORIZED_TELEGRAM_USER_ID = os.environ.get("AUTHORIZED_TELEGRAM_USER_ID", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip().strip('"').strip("'")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest").strip().strip('"').strip("'")
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip().strip('"').strip("'").rstrip("/")
 
 INSTAGRAM_SCOPES = "instagram_business_basic,instagram_business_content_publish"
 FACEBOOK_SCOPES = "pages_show_list,pages_read_engagement,pages_manage_posts"
@@ -246,6 +246,53 @@ async def health() -> dict[str, Any]:
     }
 
 
+@app.get("/debug/gemini")
+async def debug_gemini(secret: str = "") -> dict[str, Any]:
+    raw_key = os.environ.get("GEMINI_API_KEY", "")
+    clean_key = raw_key.strip().strip('"').strip("'")
+    res_data: dict[str, Any] = {
+        "gemini_api_key_configured": bool(raw_key),
+        "key_length": len(raw_key),
+        "key_prefix": raw_key[:7] if raw_key else "",
+        "key_suffix": raw_key[-4:] if raw_key else "",
+        "has_outer_whitespace": raw_key != raw_key.strip() if raw_key else False,
+        "has_quotes": ('"' in raw_key or "'" in raw_key) if raw_key else False,
+        "configured_model": GEMINI_MODEL,
+    }
+
+    if secret != TELEGRAM_WEBHOOK_SECRET:
+        res_data["note"] = "Pass ?secret=<TELEGRAM_WEBHOOK_SECRET> to run live test calls."
+        return res_data
+
+    test_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
+    test_payload = {"contents": [{"parts": [{"text": "Reply with OK"}]}]}
+    timeout = httpx.Timeout(connect=15, read=30, write=15, pool=5)
+
+    # Test 1: using params={'key': ...}
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r1 = await client.post(test_url, params={"key": clean_key}, json=test_payload)
+            res_data["test_via_param"] = {
+                "status_code": r1.status_code,
+                "body": r1.text[:400],
+            }
+    except Exception as e:
+        res_data["test_via_param"] = {"error": str(e)}
+
+    # Test 2: using header x-goog-api-key
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r2 = await client.post(test_url, headers={"x-goog-api-key": clean_key}, json=test_payload)
+            res_data["test_via_header"] = {
+                "status_code": r2.status_code,
+                "body": r2.text[:400],
+            }
+    except Exception as e:
+        res_data["test_via_header"] = {"error": str(e)}
+
+    return res_data
+
+
 @app.get("/privacy", response_class=HTMLResponse)
 async def privacy_policy() -> str:
     return """
@@ -412,6 +459,8 @@ Return only the final caption, with no title or analysis."""
             candidate_models.append(m)
 
     last_error = None
+    clean_key = (GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY", "")).strip().strip('"').strip("'")
+    headers = {"x-goog-api-key": clean_key}
     timeout = httpx.Timeout(connect=15, read=60, write=30, pool=15)
     async with httpx.AsyncClient(timeout=timeout) as client:
         for model in candidate_models:
@@ -419,7 +468,8 @@ Return only the final caption, with no title or analysis."""
                 try:
                     response = await client.post(
                         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                        params={"key": GEMINI_API_KEY},
+                        params={"key": clean_key},
+                        headers=headers,
                         json=payload,
                     )
                     if response.is_success:
@@ -430,7 +480,13 @@ Return only the final caption, with no title or analysis."""
                             return caption[:2200]
                     else:
                         logger.warning("Gemini %s returned HTTP %s: %s", model, response.status_code, response.text[:300])
-                        last_error = f"HTTP {response.status_code}: {response.text[:120]}"
+                        err_msg = ""
+                        try:
+                            err_body = response.json().get("error", {})
+                            err_msg = err_body.get("message") or err_body.get("status")
+                        except Exception:
+                            pass
+                        last_error = f"HTTP {response.status_code}: {err_msg or response.text[:120]}"
                         if response.status_code in {400, 404}:
                             # Incompatible or deprecated model, break to try next model immediately
                             break

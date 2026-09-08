@@ -72,6 +72,64 @@ app = FastAPI(title="Photo Automation")
 app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET or "not-configured")
 
 
+def get_public_base_url() -> str:
+    url = os.environ.get("PUBLIC_BASE_URL", "").strip().strip('"').strip("'").rstrip("/")
+    if url and "YOUR-SERVICE" not in url:
+        return url
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    if render_url:
+        return render_url
+    return "https://photo-automation-ggcc.onrender.com"
+
+
+def normalize_image_for_social(image_path: Path) -> Path:
+    """Ensure image is clean JPEG and aspect ratio is within Instagram's allowed range (0.80 to 1.91).
+    
+    If aspect ratio is outside this range (e.g. 0.74 or 2.1), pad canvas with blurred
+    background of the same image so the photo is never cropped and Instagram will accept it.
+    """
+    try:
+        from PIL import Image, ImageFilter
+        with Image.open(image_path) as im:
+            rgb_im = im.convert("RGB")
+            w, h = rgb_im.size
+            if h == 0 or w == 0:
+                return image_path
+            ratio = w / h
+            if 0.80 <= ratio <= 1.91:
+                if image_path.suffix.lower() not in {".jpg", ".jpeg"}:
+                    target_file = image_path.with_suffix(".jpg")
+                    rgb_im.save(target_file, "JPEG", quality=95)
+                    return target_file
+                return image_path
+
+            if ratio < 0.80:
+                # Too tall: pad width to achieve 4:5 (0.80)
+                target_w = int(h * 0.80)
+                target_h = h
+                bg = rgb_im.resize((target_w, target_h), Image.Resampling.BICUBIC).filter(ImageFilter.GaussianBlur(radius=25))
+                offset_x = (target_w - w) // 2
+                bg.paste(rgb_im, (offset_x, 0))
+                out_im = bg
+            else:
+                # Too wide: pad height to achieve 1.91:1
+                target_w = w
+                target_h = int(w / 1.91)
+                bg = rgb_im.resize((target_w, target_h), Image.Resampling.BICUBIC).filter(ImageFilter.GaussianBlur(radius=25))
+                offset_y = (target_h - h) // 2
+                bg.paste(rgb_im, (0, offset_y))
+                out_im = bg
+
+            target_file = image_path.with_suffix(".jpg")
+            out_im.save(target_file, "JPEG", quality=95)
+            logger.info("Normalized image %s from %sx%s (ratio %.2f) to %sx%s (ratio %.2f)", image_path.name, w, h, ratio, out_im.width, out_im.height, out_im.width / out_im.height)
+            return target_file
+    except Exception as e:
+        logger.warning("Image normalization skipped for %s: %s", image_path, e)
+        return image_path
+
+
+
 def database() -> sqlite3.Connection:
     DATABASE_FILE.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(DATABASE_FILE)
@@ -154,7 +212,7 @@ def threads_configured() -> bool:
 
 
 def telegram_configured() -> bool:
-    return all([TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, AUTHORIZED_TELEGRAM_USER_ID, GEMINI_API_KEY, PUBLIC_BASE_URL])
+    return all([TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, AUTHORIZED_TELEGRAM_USER_ID, GEMINI_API_KEY, get_public_base_url()])
 
 
 def fernet() -> Fernet:
@@ -236,6 +294,7 @@ async def ping() -> dict[str, Any]:
 async def health() -> dict[str, Any]:
     return {
         "ok": True,
+        "public_base_url": get_public_base_url(),
         "instagram_oauth_configured": configured(),
         "facebook_oauth_configured": facebook_configured(),
         "threads_oauth_configured": threads_configured(),
@@ -375,7 +434,7 @@ async def telegram_send_preview(post: sqlite3.Row | dict[str, Any]) -> None:
     caption_text = f"📝 Social Draft (Publish to: {destinations}):\n\n{post['caption']}\n\nNothing will be published until you approve."
 
     # First attempt: send photo by public URL
-    photo_url = f"{PUBLIC_BASE_URL}/media/{post['media_name']}"
+    photo_url = f"{get_public_base_url()}/media/{post['media_name']}"
     sent = False
     try:
         await telegram_api(
@@ -447,7 +506,7 @@ Return only the final caption, with no title or analysis."""
         "contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": mime_type, "data": image_data}}]}],
         "generationConfig": {
             "temperature": 0.65,
-            "maxOutputTokens": 500,
+            "maxOutputTokens": 2048,
         },
     }
     
@@ -461,7 +520,7 @@ Return only the final caption, with no title or analysis."""
     last_error = None
     clean_key = (GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY", "")).strip().strip('"').strip("'")
     headers = {"x-goog-api-key": clean_key}
-    timeout = httpx.Timeout(connect=15, read=60, write=30, pool=15)
+    timeout = httpx.Timeout(connect=15, read=90, write=30, pool=15)
     async with httpx.AsyncClient(timeout=timeout) as client:
         for model in candidate_models:
             for attempt in range(2):
@@ -503,11 +562,18 @@ async def publish_to_instagram(post: sqlite3.Row | dict[str, Any]) -> str:
     instagram_user_id = instagram.get("profile", {}).get("user_id") or instagram.get("user_id")
     if not instagram_user_id:
         raise RuntimeError("Connected Instagram account ID is missing. Reconnect Instagram.")
+    media_path = MEDIA_DIR / post["media_name"]
+    if media_path.exists():
+        normalize_image_for_social(media_path)
+
+    img_url = f"{get_public_base_url()}/media/{post['media_name']}"
+    logger.info("Publishing to Instagram: image_url=%s", img_url)
+
     async with httpx.AsyncClient(timeout=90) as client:
         container_response = await client.post(
             f"https://graph.instagram.com/{instagram_user_id}/media",
             data={
-                "image_url": f"{PUBLIC_BASE_URL}/media/{post['media_name']}",
+                "image_url": img_url,
                 "caption": post["caption"],
                 "access_token": access_token,
             },
@@ -563,11 +629,17 @@ async def publish_to_facebook_page(post: sqlite3.Row | dict[str, Any]) -> str:
     page_id = facebook.get("id")
     if not access_token or not page_id:
         raise RuntimeError("Connected Facebook Page information is missing. Reconnect Facebook Page.")
+
+    media_path = MEDIA_DIR / post["media_name"]
+    if media_path.exists():
+        normalize_image_for_social(media_path)
+
+    img_url = f"{get_public_base_url()}/media/{post['media_name']}"
     async with httpx.AsyncClient(timeout=90) as client:
         response = await client.post(
             f"https://graph.facebook.com/v23.0/{page_id}/photos",
             data={
-                "url": f"{PUBLIC_BASE_URL}/media/{post['media_name']}",
+                "url": img_url,
                 "caption": post["caption"],
                 "access_token": access_token,
             },
@@ -595,12 +667,18 @@ async def publish_to_threads(post: sqlite3.Row | dict[str, Any]) -> str:
     threads_user_id = threads.get("profile", {}).get("id") or threads.get("user_id") or threads.get("id")
     if not access_token or not threads_user_id:
         raise RuntimeError("Connected Threads account ID is missing. Reconnect Threads.")
+
+    media_path = MEDIA_DIR / post["media_name"]
+    if media_path.exists():
+        normalize_image_for_social(media_path)
+
+    img_url = f"{get_public_base_url()}/media/{post['media_name']}"
     async with httpx.AsyncClient(timeout=90) as client:
         container_response = await client.post(
             f"https://graph.threads.net/v1.0/{threads_user_id}/threads",
             data={
                 "media_type": "IMAGE",
-                "image_url": f"{PUBLIC_BASE_URL}/media/{post['media_name']}",
+                "image_url": img_url,
                 "text": post["caption"],
                 "access_token": access_token,
             },
@@ -758,14 +836,32 @@ async def refresh_tokens_endpoint() -> dict[str, Any]:
     }
 
 
-@app.get("/media/{media_name}")
+@app.api_route("/media/{media_name}", methods=["GET", "HEAD"])
 async def media(media_name: str) -> FileResponse:
     if Path(media_name).name != media_name:
         raise HTTPException(status_code=404, detail="Not found")
     path = MEDIA_DIR / media_name
     if not path.exists():
+        logger.warning("Media file not found: %s", path)
         raise HTTPException(status_code=404, detail="Not found")
-    return FileResponse(path)
+
+    ext = path.suffix.lower()
+    media_type = "image/jpeg"
+    if ext == ".png":
+        media_type = "image/png"
+    elif ext == ".webp":
+        media_type = "image/webp"
+
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'inline; filename="{media_name}"',
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "public, max-age=3600",
+        },
+    )
+
 
 
 @app.post("/telegram/webhook/{webhook_secret}")
@@ -833,8 +929,11 @@ async def handle_telegram_message(message: dict[str, Any]) -> None:
     post_id = str(uuid4())
     media_name = f"{post_id}{extension}"
     MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-    (MEDIA_DIR / media_name).write_bytes(download.content)
-    caption = await generate_caption(MEDIA_DIR / media_name, mime_type)
+    raw_target = MEDIA_DIR / media_name
+    raw_target.write_bytes(download.content)
+    normalized_target = normalize_image_for_social(raw_target)
+    media_name = normalized_target.name
+    caption = await generate_caption(normalized_target, mime_type)
     connection = database()
     connection.execute(
         "INSERT INTO posts (id, telegram_chat_id, telegram_user_id, media_name, mime_type, caption, status) VALUES (?, ?, ?, ?, ?, ?, 'AWAITING_APPROVAL')",

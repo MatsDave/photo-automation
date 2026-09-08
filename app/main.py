@@ -73,13 +73,18 @@ app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET or "not-configur
 
 
 def get_public_base_url() -> str:
-    url = os.environ.get("PUBLIC_BASE_URL", "").strip().strip('"').strip("'").rstrip("/")
-    if url and "YOUR-SERVICE" not in url:
-        return url
-    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    # 1. On Render, RENDER_EXTERNAL_URL is automatically injected by the platform with the exact active domain
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip().strip('"').strip("'").rstrip("/")
     if render_url:
         return render_url
+
+    # 2. Check PUBLIC_BASE_URL, filtering out placeholders and known domain typos missing -ggcc suffix
+    url = os.environ.get("PUBLIC_BASE_URL", "").strip().strip('"').strip("'").rstrip("/")
+    if url and "YOUR-SERVICE" not in url and url != "https://photo-automation.onrender.com":
+        return url
+
     return "https://photo-automation-ggcc.onrender.com"
+
 
 
 def normalize_image_for_social(image_path: Path) -> Path:

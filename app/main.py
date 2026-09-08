@@ -61,7 +61,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 AUTHORIZED_TELEGRAM_USER_ID = os.environ.get("AUTHORIZED_TELEGRAM_USER_ID", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 
 INSTAGRAM_SCOPES = "instagram_business_basic,instagram_business_content_publish"
@@ -325,15 +325,60 @@ async def telegram_send_preview(post: sqlite3.Row | dict[str, Any]) -> None:
             [{"text": "Cancel", "callback_data": f"cancel:{post['id']}"}],
         ]
     }
-    await telegram_api(
-        "sendPhoto",
-        {
-            "chat_id": post["telegram_chat_id"],
-            "photo": f"{PUBLIC_BASE_URL}/media/{post['media_name']}",
-            "caption": f"📝 Social Draft (Publish to: {destinations}):\n\n{post['caption']}\n\nNothing will be published until you approve.",
-            "reply_markup": keyboard,
-        },
-    )
+    caption_text = f"📝 Social Draft (Publish to: {destinations}):\n\n{post['caption']}\n\nNothing will be published until you approve."
+
+    # First attempt: send photo by public URL
+    photo_url = f"{PUBLIC_BASE_URL}/media/{post['media_name']}"
+    sent = False
+    try:
+        await telegram_api(
+            "sendPhoto",
+            {
+                "chat_id": post["telegram_chat_id"],
+                "photo": photo_url,
+                "caption": caption_text,
+                "reply_markup": keyboard,
+            },
+        )
+        sent = True
+    except Exception as e:
+        logger.warning("sendPhoto by URL failed (%s), attempting direct file upload", e)
+
+    # Second attempt: send photo directly via multipart upload if URL fetch failed
+    if not sent:
+        media_path = MEDIA_DIR / post["media_name"]
+        if media_path.exists():
+            try:
+                timeout = httpx.Timeout(connect=15, read=60, write=30, pool=10)
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    files = {"photo": (post["media_name"], media_path.read_bytes(), post["mime_type"])}
+                    data = {
+                        "chat_id": str(post["telegram_chat_id"]),
+                        "caption": caption_text,
+                        "reply_markup": json.dumps(keyboard),
+                    }
+                    res = await client.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                        data=data,
+                        files=files,
+                    )
+                    if res.is_success and res.json().get("ok"):
+                        sent = True
+                    else:
+                        logger.warning("Direct photo upload to Telegram failed: %s", res.text[:300])
+            except Exception as e:
+                logger.warning("Direct photo upload to Telegram raised exception: %s", e)
+
+    # Final fallback: send caption as text message with action buttons so the user is never stuck
+    if not sent:
+        await telegram_api(
+            "sendMessage",
+            {
+                "chat_id": post["telegram_chat_id"],
+                "text": caption_text,
+                "reply_markup": keyboard,
+            },
+        )
 
 
 async def generate_caption(media_path: Path, mime_type: str) -> str:
@@ -356,30 +401,44 @@ Return only the final caption, with no title or analysis."""
         "generationConfig": {
             "temperature": 0.65,
             "maxOutputTokens": 500,
-            "thinkingConfig": {"thinkingLevel": "MINIMAL"},
         },
     }
-    timeout = httpx.Timeout(connect=15, read=120, write=30, pool=15)
+    
+    # Try preferred model first, then reliable fallback models
+    models_to_try = [GEMINI_MODEL, "gemini-flash-latest", "gemini-3.5-flash"]
+    candidate_models = []
+    for m in models_to_try:
+        if m and m not in candidate_models:
+            candidate_models.append(m)
+
+    last_error = None
+    timeout = httpx.Timeout(connect=15, read=60, write=30, pool=15)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        response = None
-        for attempt in range(3):
-            response = await client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-                params={"key": GEMINI_API_KEY},
-                json=payload,
-            )
-            if response.status_code not in {429, 500, 502, 503, 504} or attempt == 2:
-                break
-            await asyncio.sleep(2 * (attempt + 1))
-    if response.is_error:
-        logger.warning("Gemini caption request returned HTTP %s", response.status_code)
-        raise RuntimeError("Caption generation failed")
-    body = response.json()
-    parts = body.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-    caption = "\n".join(part.get("text", "") for part in parts).strip()
-    if not caption:
-        raise RuntimeError("Caption generation returned no caption")
-    return caption[:2200]
+        for model in candidate_models:
+            for attempt in range(2):
+                try:
+                    response = await client.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                        params={"key": GEMINI_API_KEY},
+                        json=payload,
+                    )
+                    if response.is_success:
+                        body = response.json()
+                        parts = body.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                        caption = "\n".join(part.get("text", "") for part in parts).strip()
+                        if caption:
+                            return caption[:2200]
+                    else:
+                        logger.warning("Gemini %s returned HTTP %s: %s", model, response.status_code, response.text[:300])
+                        last_error = f"HTTP {response.status_code}: {response.text[:120]}"
+                        if response.status_code in {400, 404}:
+                            # Incompatible or deprecated model, break to try next model immediately
+                            break
+                except Exception as e:
+                    logger.warning("Gemini %s attempt %s failed: %s", model, attempt, e)
+                    last_error = str(e)
+                await asyncio.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"Caption generation failed ({last_error or 'no response'})")
 
 
 async def publish_to_instagram(post: sqlite3.Row | dict[str, Any]) -> str:
@@ -669,8 +728,14 @@ async def process_telegram_update(update: dict[str, Any]) -> None:
             await handle_telegram_callback(update["callback_query"])
         elif "message" in update:
             await handle_telegram_message(update["message"])
-    except Exception:
-        logger.exception("Telegram update processing failed")
+    except Exception as e:
+        logger.exception("Telegram update processing failed: %s", e)
+        chat_id = update.get("message", {}).get("chat", {}).get("id") or update.get("callback_query", {}).get("message", {}).get("chat", {}).get("id")
+        if chat_id:
+            try:
+                await telegram_api("sendMessage", {"chat_id": chat_id, "text": f"❌ Error: {e}\n\nPlease try sending the photo again."})
+            except Exception:
+                pass
 
 
 def authorised(message: dict[str, Any]) -> bool:

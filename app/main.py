@@ -61,7 +61,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 AUTHORIZED_TELEGRAM_USER_ID = os.environ.get("AUTHORIZED_TELEGRAM_USER_ID", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip().strip('"').strip("'")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest").strip().strip('"').strip("'")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-lite-latest").strip().strip('"').strip("'")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip().strip('"').strip("'").rstrip("/")
 
 INSTAGRAM_SCOPES = "instagram_business_basic,instagram_business_content_publish"
@@ -515,8 +515,15 @@ Return only the final caption, with no title or analysis."""
         },
     }
     
-    # Try preferred model first, then reliable fallback models
-    models_to_try = [GEMINI_MODEL, "gemini-flash-latest", "gemini-3.5-flash"]
+    # Try fastest, high-throughput models first, with immediate failover across models
+    models_to_try = [
+        "gemini-flash-lite-latest",
+        "gemini-3.5-flash",
+        "gemini-3.6-flash",
+        GEMINI_MODEL,
+        "gemini-flash-latest",
+        "gemini-3.5-flash-lite",
+    ]
     candidate_models = []
     for m in models_to_try:
         if m and m not in candidate_models:
@@ -551,13 +558,14 @@ Return only the final caption, with no title or analysis."""
                         except Exception:
                             pass
                         last_error = f"HTTP {response.status_code}: {err_msg or response.text[:120]}"
-                        if response.status_code in {400, 404}:
-                            # Incompatible or deprecated model, break to try next model immediately
+                        if response.status_code in {400, 404, 429, 503}:
+                            # Incompatible, deprecated, rate-limited or high-demand model: move to fallback model immediately!
                             break
                 except Exception as e:
                     logger.warning("Gemini %s attempt %s failed: %s", model, attempt, e)
                     last_error = str(e)
-                await asyncio.sleep(1.5 * (attempt + 1))
+                await asyncio.sleep(1.0)
+
     raise RuntimeError(f"Caption generation failed ({last_error or 'no response'})")
 
 

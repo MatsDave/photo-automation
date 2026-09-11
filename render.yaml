@@ -12,7 +12,7 @@ services:
       - key: DATA_DIR
         value: /tmp/photo-automation
       - key: GEMINI_MODEL
-        value: gemini-flash-latest
+        value: gemini-flash-lite-latest
       - key: INSTAGRAM_APP_ID
         sync: false
       - key: INSTAGRAM_APP_SECRET
